@@ -15,6 +15,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     const applyFilterBtn = document.getElementById('applyFilter');
 
     const downloadYearlyReportBtn = document.getElementById('downloadYearlyReport');
+    // NOTE: we no longer depend on a visible canvas for the PDF chart.
+    // Keeping the query in case you show a chart in the UI separately:
     const chartCanvas = document.getElementById('reportChart');
 
     const timelineDiv = document.getElementById('timeline');
@@ -434,16 +436,13 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (!window.jspdf || !window.jspdf.jsPDF || !('autoTable' in (window.jspdf.jsPDF.API || {}))) {
             throw new Error('PDF-Bibliotheken nicht geladen (jsPDF oder AutoTable fehlen).');
         }
-        if (!chartCanvas || !(chartCanvas.getContext && chartCanvas.getContext('2d'))) {
-            console.warn('Chart canvas fehlt – Diagramm wird im PDF ausgelassen.');
-        }
 
         // Sort readings ascending by timestamp for tables
         const sorted = [...readings].sort((a, b) => a.timestamp - b.timestamp);
         const agg = aggregateYear(sorted, year);
 
-        // Prepare a chart image (kWh per user)
-        const chartDataURL = chartCanvas ? await renderUserBarChart(chartCanvas, agg.byUser, year) : null;
+        // Prepare a chart image (kWh per user) using an offscreen canvas
+        const chartDataURL = await renderUserBarChart(agg.byUser, year);
 
         // Build PDF
         const { jsPDF } = window.jspdf;
@@ -484,6 +483,11 @@ document.addEventListener('DOMContentLoaded', async () => {
             const chartHeight = Math.min(260, chartWidth * 0.45);
             doc.addImage(chartDataURL, 'PNG', margin, cursorY, chartWidth, chartHeight);
             cursorY += chartHeight + 16;
+        } else {
+            doc.setFont('helvetica', 'italic');
+            doc.setFontSize(10);
+            doc.text('Hinweis: Diagramm konnte nicht erzeugt werden.', margin, cursorY);
+            cursorY += 16;
         }
 
         // Table: per-user summary
@@ -610,14 +614,32 @@ document.addEventListener('DOMContentLoaded', async () => {
         doc.save(filename);
     }
 
-    async function renderUserBarChart(canvasEl, byUser, year) {
+    // NEW: offscreen chart rendering for PDF
+    async function renderUserBarChart(byUser, year) {
         try {
+            if (typeof Chart === 'undefined') return null;
+
+            // Fixed pixel dimensions for predictable, crisp output
+            const DPR = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+            const pxWidth = 1200;  // logical pixels
+            const pxHeight = 520;
+
+            const offscreen = document.createElement('canvas');
+            // Set real backing size
+            offscreen.width = Math.floor(pxWidth * DPR);
+            offscreen.height = Math.floor(pxHeight * DPR);
+            // Scale context so chart draws at correct scale
+            const ctx = offscreen.getContext('2d');
+            if (!ctx) return null;
+            ctx.scale(DPR, DPR);
+
+            // Also set CSS size to match logical size (not strictly needed since off-DOM)
+            offscreen.style.width = `${pxWidth}px`;
+            offscreen.style.height = `${pxHeight}px`;
+
             const labels = Object.keys(byUser).sort((a, b) => a.localeCompare(b));
             const data = labels.map(u => round1(byUser[u].kWh || 0));
             if (labels.length === 0) return null;
-
-            const ctx = canvasEl.getContext('2d');
-            if (!ctx || typeof Chart === 'undefined') return null;
 
             const chart = new Chart(ctx, {
                 type: 'bar',
@@ -630,18 +652,21 @@ document.addEventListener('DOMContentLoaded', async () => {
                 },
                 options: {
                     responsive: false,
+                    animation: false,
                     plugins: {
                         legend: { display: true },
                         title: { display: false }
                     },
+                    layout: { padding: { top: 8, right: 8, bottom: 8, left: 8 } },
                     scales: {
-                        y: { beginAtZero: true }
+                        y: { beginAtZero: true, ticks: { precision: 0 } }
                     }
                 }
             });
 
-            await new Promise(r => setTimeout(r, 50));
-            const url = canvasEl.toDataURL('image/png');
+            // Give Chart.js a tick to layout (no animation; still async)
+            await new Promise(r => setTimeout(r, 30));
+            const url = offscreen.toDataURL('image/png');
             chart.destroy();
             return url;
         } catch (e) {
