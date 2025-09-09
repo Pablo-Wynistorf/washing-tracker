@@ -6,8 +6,7 @@ import path from 'path';
 import cookieParser from 'cookie-parser';
 import serverless from 'serverless-http';
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { PutCommand, QueryCommand } from "@aws-sdk/lib-dynamodb";
-// REMOVED: import { GetItemCommand, UpdateItemCommand } from "@aws-sdk/client-dynamodb";
+import { PutCommand, QueryCommand, DeleteCommand } from "@aws-sdk/lib-dynamodb";
 import { v4 as uuidv4 } from 'uuid';
 import { fileURLToPath } from 'url';
 
@@ -49,6 +48,7 @@ async function checkAuthentication(req, res, next) {
   }
 }
 
+// --- Helpers ---
 function parseYearMonth(queryYear, queryMonth) {
   const now = new Date();
   const year = !isNaN(parseInt(queryYear)) ? parseInt(queryYear) : now.getUTCFullYear();
@@ -65,24 +65,14 @@ function parseYearMonth(queryYear, queryMonth) {
   return { year, startTimestamp, endTimestamp };
 }
 
-function ymKeyParts(dateMs) {
-  const d = new Date(dateMs);
-  const y = d.getUTCFullYear();
-  const m = d.getUTCMonth();
-  const mm = String(m + 1).padStart(2, '0');
-  return { year: y, month0: m, ym: `${y}-${mm}`, monthStartTs: Date.UTC(y, m, 1, 0, 0, 0) };
-}
-
 // --- Routes ---
 
 app.get('/username', checkAuthentication, (req, res) => {
-  if (!req.user) {
-    return res.status(401).json({ message: 'User not authenticated.' });
-  }
+  if (!req.user) return res.status(401).json({ message: 'User not authenticated.' });
   res.json({ username: req.username });
 });
 
-// Liste der Messungen (optional nach Jahr/Monat)
+// List readings (optional by year/month)
 app.get('/readings', checkAuthentication, async (req, res) => {
   try {
     const { startTimestamp, endTimestamp } = parseYearMonth(req.query.year, req.query.month);
@@ -101,9 +91,7 @@ app.get('/readings', checkAuthentication, async (req, res) => {
     });
 
     const result = await ddbClient.send(command);
-    if (!result.Items) {
-      return res.status(500).json({ message: 'Could not retrieve readings.' });
-    }
+    if (!result.Items) return res.status(500).json({ message: 'Could not retrieve readings.' });
 
     res.json(result.Items);
   } catch (error) {
@@ -112,15 +100,17 @@ app.get('/readings', checkAuthentication, async (req, res) => {
   }
 });
 
+// Create reading (optionally on behalf of someone else)
 app.post('/readings', checkAuthentication, async (req, res) => {
-  const { currentKWh, notes = '' } = req.body;
-  const username = req.username;
+  const { currentKWh, notes = '', forUsername } = req.body;
+  const creator = req.username;
 
   if (typeof currentKWh !== 'number' || !isFinite(currentKWh) || currentKWh <= 0) {
     return res.status(400).json({ message: 'Invalid or missing currentKWh value.' });
   }
 
   try {
+    // Get last reading to compute delta
     const lastResult = await ddbClient.send(new QueryCommand({
       TableName: TABLE_NAME,
       IndexName: 'TimestampIndex',
@@ -142,11 +132,20 @@ app.post('/readings', checkAuthentication, async (req, res) => {
     }
 
     const now = Date.now();
-    const { ym, monthStartTs } = ymKeyParts(now);
+
+    const ownerUsername = (typeof forUsername === 'string' && forUsername.trim() !== '')
+      ? forUsername.trim()
+      : creator;
+
+    const onBehalf = ownerUsername !== creator;
 
     const reading = {
       washId: uuidv4(),
-      username,
+      createdBy: creator,       // who entered it
+      ownerUsername,            // who it is for
+      onBehalf,                 // boolean marker
+      // legacy compatibility
+      username: ownerUsername,  // keep "username" as display of the owner in UI lists
       startKWh,
       endKWh,
       deltaKWh,
@@ -155,20 +154,16 @@ app.post('/readings', checkAuthentication, async (req, res) => {
       GlobalPK: 'ALL_READINGS'
     };
 
-    await ddbClient.send(new PutCommand({
-      TableName: TABLE_NAME,
-      Item: reading
-    }));
+    await ddbClient.send(new PutCommand({ TableName: TABLE_NAME, Item: reading }));
 
     return res.status(201).json({ reading });
-
   } catch (error) {
     console.error('Error saving reading:', error);
     return res.status(500).json({ message: 'Error saving reading', error: error.message });
   }
 });
 
-// Letzter Zählerstand
+// Latest kWh
 app.get('/latest-kwh', checkAuthentication, async (req, res) => {
   try {
     const query = new QueryCommand({
@@ -190,8 +185,35 @@ app.get('/latest-kwh', checkAuthentication, async (req, res) => {
   }
 });
 
+// Delete reading — only the creator may delete
+app.delete('/readings/:washId', checkAuthentication, async (req, res) => {
+  const { washId } = req.params;
+  const me = req.username;
 
-// Statische Files
+  if (!washId) return res.status(400).json({ message: 'Missing washId.' });
+
+  try {
+    // Allow if createdBy == me OR (legacy item with no createdBy AND username == me)
+    await ddbClient.send(new DeleteCommand({
+      TableName: TABLE_NAME,
+      Key: { washId },
+      ConditionExpression: 'createdBy = :me OR (attribute_not_exists(createdBy) AND #un = :me)',
+      ExpressionAttributeValues: { ':me': me },
+      ExpressionAttributeNames: { '#un': 'username' }
+    }));
+
+    return res.status(204).send();
+  } catch (error) {
+    // ConditionalCheckFailedException -> not allowed
+    if (error?.name === 'ConditionalCheckFailedException') {
+      return res.status(403).json({ message: 'Not allowed to delete this measurement.' });
+    }
+    console.error('Error deleting reading:', error);
+    return res.status(500).json({ message: 'Error deleting reading', error: error.message });
+  }
+});
+
+// Static files (protected)
 app.use('/', checkAuthentication, express.static(path.join(__dirname, 'public', 'home')));
 
 app.use((req, res) => {

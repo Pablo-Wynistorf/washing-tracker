@@ -10,6 +10,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   const deltaKWhInput = document.getElementById('deltaKWh');
   const notesInput = document.getElementById('notes');
 
+  const onBehalfToggle = document.getElementById('onBehalfToggle');
+  const onBehalfRow = document.getElementById('onBehalfRow');
+  const onBehalfUser = document.getElementById('onBehalfUser');
+
   const filterYear = document.getElementById('filterYear');
   const filterMonth = document.getElementById('filterMonth');
   const applyFilterBtn = document.getElementById('applyFilter');
@@ -41,7 +45,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   function round1(n) { return Math.round(n * 2) / 2; }
   function parseNum(v) { const n = typeof v === 'number' ? v : Number(v || 0); return Number.isFinite(n) ? n : 0; }
 
-  // Helpers specifically for user input (accept comma or dot)
   function toNumberOrNaN(str) {
     if (str == null) return NaN;
     const s = String(str).trim();
@@ -50,6 +53,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     return Number.isFinite(n) ? n : NaN;
   }
   function isBlank(v) { return String(v ?? '').trim() === ''; }
+
+  // On behalf toggle
+  onBehalfToggle.addEventListener('change', () => {
+    onBehalfRow.classList.toggle('hidden', !onBehalfToggle.checked);
+    if (!onBehalfToggle.checked) onBehalfUser.value = '';
+  });
 
   function computeDelta() {
     const prev = toNumberOrNaN(prevKWhInput.value);
@@ -65,10 +74,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     deltaKWhInput.value = nf1.format(delta);
   }
 
-  currentKWhInput.addEventListener('input', () => {
-    computeDelta();
-  });
-
+  currentKWhInput.addEventListener('input', computeDelta);
   currentKWhInput.addEventListener('blur', () => {
     const n = toNumberOrNaN(currentKWhInput.value);
     if (Number.isFinite(n)) {
@@ -147,13 +153,21 @@ document.addEventListener('DOMContentLoaded', async () => {
       return setFormMsg(`Aktueller Zählerstand (${nf1.format(curr)}) muss ≥ vorheriger (${nf1.format(prev)}) sein.`, 'error');
     }
 
+    // On behalf payload
+    let forUsername;
+    if (onBehalfToggle.checked) {
+      const target = (onBehalfUser.value || '').trim();
+      if (!target) return setFormMsg('Bitte einen Benutzer für "im Auftrag" auswählen.', 'error');
+      forUsername = target;
+    }
+
     hideFormMsg();
 
     try {
       const res = await fetch('/readings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ currentKWh: curr, notes }),
+        body: JSON.stringify({ currentKWh: curr, notes, ...(forUsername ? { forUsername } : {}) }),
       });
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
@@ -162,6 +176,8 @@ document.addEventListener('DOMContentLoaded', async () => {
 
       await res.json();
       readingForm.reset();
+      onBehalfRow.classList.add('hidden');
+
       await fetchLatestKWh();
       await fetchReadings();
       await fetchAndRenderYearlySummary();
@@ -224,6 +240,29 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
     noReadingsMessage.classList.add('hidden');
 
+    // sort all readings newest → oldest
+    const allSorted = [...readings].sort((a, b) => b.timestamp - a.timestamp);
+
+    // find the latest 3 created by currentUser
+    const latestId = allSorted
+      .filter(r => r.createdBy === currentUser || (!r.createdBy && r.username === currentUser))
+      .slice(0, 1)
+      .map(r => r.washId);
+
+    // collect usernames from current timeline
+    const uniqueUsers = new Set(readings.map(r => r.ownerUsername || r.username).filter(Boolean));
+
+    // rebuild onBehalfUser select
+    onBehalfUser.innerHTML = '<option value="">-- Benutzer auswählen --</option>';
+    uniqueUsers.forEach(u => {
+      if (u !== currentUser) {
+        const opt = document.createElement('option');
+        opt.value = u;
+        opt.textContent = u;
+        onBehalfUser.appendChild(opt);
+      }
+    });
+
     // group by day
     const grouped = {};
     readings.forEach(r => {
@@ -234,7 +273,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     const sortedDays = Object.keys(grouped).sort((a, b) => new Date(b) - new Date(a));
 
-    sortedDays.forEach((dayKey, dayIdx) => {
+    sortedDays.forEach((dayKey) => {
       const date = new Date(dayKey);
       const formatted = date.toLocaleDateString('de-CH', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
 
@@ -245,24 +284,36 @@ document.addEventListener('DOMContentLoaded', async () => {
 
       const dayItems = grouped[dayKey].sort((a, b) => b.timestamp - a.timestamp);
 
-      dayItems.forEach((r, idx) => {
+      dayItems.forEach((r) => {
         const time = new Date(r.timestamp).toLocaleTimeString('de-CH', { hour: '2-digit', minute: '2-digit' });
-        const isLastOverall = (dayIdx === (sortedDays.length - 1)) && (idx === (dayItems.length - 1));
 
-        const card = document.createElement('div');
-        card.className = 'relative pl-8 mb-10';
         const start = round1(parseNum(r.startKWh));
         const end = round1(parseNum(r.endKWh));
         const delta = round1(parseNum(r.deltaKWh));
 
+        const card = document.createElement('div');
+        card.className = 'relative pl-8 mb-10';
+
+        // DELETE button only if this washId is in latestId
+        const canDelete = latestId.includes(r.washId);
+        const deleteBtn = canDelete
+          ? `<button data-id="${escapeAttr(r.washId)}" class="delete-btn absolute top-0 right-0 text-xs px-2 py-1 bg-red-600 hover:bg-red-500 rounded">Löschen</button>`
+          : '';
+
+        const onBehalfBadge = r.onBehalf
+          ? `<span class="ml-2 text-[10px] px-2 py-0.5 rounded bg-yellow-600 align-middle">im Auftrag</span>`
+          : '';
+
         card.innerHTML = `
           <div class="absolute left-0 top-1 w-4 h-4 bg-indigo-500 rounded-full border-4 border-gray-900 z-10"></div>
-          ${!isLastOverall ? `<div class="absolute left-1 top-5 h-full border-l-2 border-dashed border-gray-600 z-0"></div>` : ''}
-
           <div class="relative p-4 rounded-lg shadow bg-blue-100 text-gray-900 dark:bg-blue-700 dark:text-gray-100">
+            ${deleteBtn}
             <div class="flex flex-col md:flex-row justify-between mb-2">
               <span class="text-sm font-semibold">${time}</span>
-              <span class="text-xs opacity-90">Benutzer: ${escapeHtml(r.username || '-')}</span>
+              <span class="text-xs opacity-90">
+                Von: ${escapeHtml(r.ownerUsername || r.username || '-')}
+                ${onBehalfBadge}
+              </span>
             </div>
 
             <p class="font-bold text-lg mb-2">${nf1.format(delta)} kWh</p>
@@ -270,6 +321,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             <div class="grid grid-cols-1 sm:grid-cols-2 gap-2 text-sm">
               <div>
                 ${r.notes ? `<p class="italic mt-1">Notiz: ${escapeHtml(r.notes)}</p>` : ''}
+                <p class="mt-1 text-xs opacity-90">Erfasst von: <span class="font-medium">${escapeHtml(r.createdBy || '-')}</span></p>
               </div>
               <div>
                 <p>Vorher: <span class="font-medium">${nf1.format(start)} kWh</span></p>
@@ -281,8 +333,32 @@ document.addEventListener('DOMContentLoaded', async () => {
         `;
         timelineDiv.appendChild(card);
       });
+
+      // wire delete buttons
+      timelineDiv.querySelectorAll('.delete-btn').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          const id = btn.getAttribute('data-id');
+          if (!id) return;
+          if (!confirm('Diese Messung wirklich löschen?')) return;
+          try {
+            const res = await fetch(`/readings/${encodeURIComponent(id)}`, { method: 'DELETE' });
+            if (res.status === 204) {
+              await fetchLatestKWh();
+              await fetchReadings();
+              await fetchAndRenderYearlySummary();
+            } else {
+              const err = await res.json().catch(() => ({}));
+              throw new Error(err.message || 'Löschen fehlgeschlagen.');
+            }
+          } catch (e) {
+            console.error('delete error', e);
+            setFormMsg(`Fehler beim Löschen: ${e.message}`, 'error');
+          }
+        });
+      });
     });
   }
+
 
   function renderMonthlySummary(readings) {
     monthlySummaryDiv.innerHTML = '';
@@ -293,14 +369,26 @@ document.addEventListener('DOMContentLoaded', async () => {
       return;
     }
 
-    // Aggregate by username in the frontend
     const byUser = {};
     readings.forEach(r => {
-      const user = r.username || 'Unbekannt';
+      const user = r.ownerUsername || r.username || 'Unbekannt';
       const delta = round1(parseNum(r.deltaKWh));
       if (!byUser[user]) byUser[user] = { sum: 0, count: 0 };
       byUser[user].sum += delta;
       byUser[user].count++;
+    });
+
+    const uniqueUsers = new Set(readings.map(r => r.ownerUsername || r.username).filter(Boolean));
+
+    // rebuild onBehalfUser select
+    onBehalfUser.innerHTML = '<option value="">-- Benutzer auswählen --</option>';
+    uniqueUsers.forEach(u => {
+      if (u !== currentUser) { // don’t allow self-selection
+        const opt = document.createElement('option');
+        opt.value = u;
+        opt.textContent = u;
+        onBehalfUser.appendChild(opt);
+      }
     });
 
     const container = document.createElement('div');
@@ -333,10 +421,9 @@ document.addEventListener('DOMContentLoaded', async () => {
       return;
     }
 
-    // Aggregate by username in the frontend
     const byUser = {};
     readings.forEach(r => {
-      const user = r.username || 'Unbekannt';
+      const user = r.ownerUsername || r.username || 'Unbekannt';
       const delta = round1(parseNum(r.deltaKWh));
       if (!byUser[user]) byUser[user] = { sum: 0, count: 0 };
       byUser[user].sum += delta;
@@ -365,6 +452,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // helpers
   function escapeHtml(s) { return String(s).replace(/[&<>"']/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m])); }
+  function escapeAttr(s) { return String(s).replace(/"/g, '&quot;'); }
 
   // ===== YEARLY REPORT (PDF) =====
   if (downloadYearlyReportBtn) {
@@ -385,14 +473,14 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   function aggregateYear(readings, year) {
     const byUser = {};
-    const byMonthUser = {}; // { '01': { user: sum } }
+    const byMonthUser = {};
     let totalKWh = 0;
     let totalCount = 0;
     let firstTs = Infinity;
     let lastTs = -Infinity;
 
     for (const r of readings) {
-      const user = r.username || 'Unbekannt';
+      const user = r.ownerUsername || r.username || 'Unbekannt';
       const d = round1(parseNum(r.deltaKWh));
       totalKWh += d;
       totalCount += 1;
@@ -412,7 +500,6 @@ document.addEventListener('DOMContentLoaded', async () => {
       byMonthUser[m][user] = (byMonthUser[m][user] || 0) + d;
     }
 
-    // normalize min/max if no data
     for (const u of Object.keys(byUser)) {
       if (byUser[u].min === Infinity) byUser[u].min = 0;
       if (byUser[u].max === -Infinity) byUser[u].max = 0;
@@ -434,21 +521,17 @@ document.addEventListener('DOMContentLoaded', async () => {
       throw new Error('PDF-Bibliotheken nicht geladen (jsPDF oder AutoTable fehlen).');
     }
 
-    // Sort readings ascending by timestamp for tables
     const sorted = [...readings].sort((a, b) => a.timestamp - b.timestamp);
     const agg = aggregateYear(sorted, year);
 
-    // Prepare a chart image (kWh per user) using an offscreen canvas
     const chartDataURL = await renderUserBarChart(agg.byUser, year);
 
-    // Build PDF
     const { jsPDF } = window.jspdf;
     const doc = new jsPDF({ unit: 'pt', format: 'a4' });
     const pageWidth = doc.internal.pageSize.getWidth();
-    const margin = 36; // 0.5in
+    const margin = 36;
     let cursorY = margin;
 
-    // Header
     doc.setFont('helvetica', 'bold');
     doc.setFontSize(18);
     doc.text(`Jahresbericht ${year}`, margin, cursorY);
@@ -465,7 +548,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     doc.text(`Erstellt am: ${genAt}`, margin, cursorY);
     cursorY += 20;
 
-    // Summary box
     const summaryLines = [
       `Gesamtverbrauch: ${nf1.format(agg.totalKWh)} kWh`,
       `Anzahl Messungen: ${agg.totalCount}`,
@@ -474,7 +556,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     drawInfoBox(doc, margin, cursorY, pageWidth - margin * 2, summaryLines);
     cursorY += 80;
 
-    // Chart
     if (chartDataURL) {
       const chartWidth = pageWidth - margin * 2;
       const chartHeight = Math.min(260, chartWidth * 0.45);
@@ -487,7 +568,6 @@ document.addEventListener('DOMContentLoaded', async () => {
       cursorY += 16;
     }
 
-    // Table: per-user summary
     doc.setFont('helvetica', 'bold');
     doc.setFontSize(13);
     doc.text('Übersicht nach Benutzer', margin, cursorY);
@@ -510,11 +590,10 @@ document.addEventListener('DOMContentLoaded', async () => {
         ];
       }),
       styles: { font: 'helvetica', fontSize: 10 },
-      headStyles: { fillColor: [55, 65, 81] }, // gray-700
+      headStyles: { fillColor: [55, 65, 81] },
       alternateRowStyles: { fillColor: [245, 246, 250] }
     });
 
-    // New page for detailed measurements per user
     doc.addPage();
     cursorY = margin;
     doc.setFont('helvetica', 'bold');
@@ -522,15 +601,16 @@ document.addEventListener('DOMContentLoaded', async () => {
     doc.text('Messungen nach Benutzer (Details)', margin, cursorY);
     cursorY += 10;
 
-    // Build one big table sorted by user then by time
     const rows = sorted
       .map(r => ({
-        Benutzer: r.username || 'Unbekannt',
+        Benutzer: r.ownerUsername || r.username || 'Unbekannt',
         Datum: new Date(r.timestamp).toLocaleString('de-CH'),
         Start: nf1.format(round1(parseNum(r.startKWh))),
         Ende: nf1.format(round1(parseNum(r.endKWh))),
         Delta: nf1.format(round1(parseNum(r.deltaKWh))),
-        Notiz: (r.notes || '').toString().replace(/\s+/g, ' ').trim()
+        Notiz: (r.notes || '').toString().replace(/\s+/g, ' ').trim(),
+        ErfasstVon: r.createdBy || '-',
+        Auftrag: r.onBehalf ? 'ja' : 'nein'
       }))
       .sort((a, b) => {
         if (a.Benutzer === b.Benutzer) return a.Datum.localeCompare(b.Datum);
@@ -544,14 +624,16 @@ document.addEventListener('DOMContentLoaded', async () => {
       body: rows.map(r => [r.Benutzer, r.Datum, r.Start, r.Ende, r.Delta, r.Notiz]),
       styles: { font: 'helvetica', fontSize: 9, cellWidth: 'wrap' },
       columnStyles: {
-        0: { cellWidth: 100 },
-        1: { cellWidth: 120 },
-        2: { cellWidth: 80 },
-        3: { cellWidth: 80 },
-        4: { cellWidth: 70 },
-        5: { cellWidth: 140 }
+        0: { cellWidth: 90 },
+        1: { cellWidth: 110 },
+        2: { cellWidth: 70 },
+        3: { cellWidth: 70 },
+        4: { cellWidth: 60 },
+        5: { cellWidth: 130 },
+        6: { cellWidth: 90 },
+        7: { cellWidth: 60 }
       },
-      headStyles: { fillColor: [31, 41, 55] }, // gray-800
+      headStyles: { fillColor: [31, 41, 55] },
       alternateRowStyles: { fillColor: [250, 250, 250] },
       didDrawPage: () => {
         const str = `Seite ${doc.internal.getNumberOfPages()}`;
@@ -561,7 +643,6 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
     });
 
-    // Final summary page
     doc.addPage();
     cursorY = margin;
 
@@ -582,12 +663,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     drawBulletList(doc, margin, cursorY, finalSummary);
     cursorY += 16 * finalSummary.length + 12;
 
-    // Per-month quick table (sum by user per month)
-    doc.setFont('helvetica', 'bold');
-    doc.setFontSize(12);
-    doc.text('Monatliche Summen (kWh) nach Benutzer', margin, cursorY);
-    cursorY += 8;
-
     const usersSorted = Object.keys(agg.byUser).sort((a, b) => a.localeCompare(b));
     const months = Array.from({ length: 12 }, (_, i) => String(i + 1).padStart(2, '0'));
 
@@ -606,33 +681,24 @@ document.addEventListener('DOMContentLoaded', async () => {
       alternateRowStyles: { fillColor: [245, 246, 250] }
     });
 
-    // Save
     const filename = `Wäsche_Jahresbericht_${year}.pdf`;
     doc.save(filename);
   }
 
-  // NEW: offscreen chart rendering for PDF
   async function renderUserBarChart(byUser, year) {
     try {
       if (typeof Chart === 'undefined') return null;
 
-      // Fixed pixel dimensions for predictable, crisp output
       const DPR = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
-      const pxWidth = 1200;  // logical pixels
+      const pxWidth = 1200;
       const pxHeight = 520;
 
       const offscreen = document.createElement('canvas');
-      // Set real backing size
       offscreen.width = Math.floor(pxWidth * DPR);
       offscreen.height = Math.floor(pxHeight * DPR);
-      // Scale context so chart draws at correct scale
       const ctx = offscreen.getContext('2d');
       if (!ctx) return null;
       ctx.scale(DPR, DPR);
-
-      // Also set CSS size to match logical size (not strictly needed since off-DOM)
-      offscreen.style.width = `${pxWidth}px`;
-      offscreen.style.height = `${pxHeight}px`;
 
       const labels = Object.keys(byUser).sort((a, b) => a.localeCompare(b));
       const data = labels.map(u => round1(byUser[u].kWh || 0));
@@ -640,28 +706,16 @@ document.addEventListener('DOMContentLoaded', async () => {
 
       const chart = new Chart(ctx, {
         type: 'bar',
-        data: {
-          labels,
-          datasets: [{
-            label: `kWh pro Benutzer (${year})`,
-            data
-          }]
-        },
+        data: { labels, datasets: [{ label: `kWh pro Benutzer (${year})`, data }] },
         options: {
           responsive: false,
           animation: false,
-          plugins: {
-            legend: { display: true },
-            title: { display: false }
-          },
+          plugins: { legend: { display: true }, title: { display: false } },
           layout: { padding: { top: 8, right: 8, bottom: 8, left: 8 } },
-          scales: {
-            y: { beginAtZero: true, ticks: { precision: 0 } }
-          }
+          scales: { y: { beginAtZero: true, ticks: { precision: 0 } } }
         }
       });
 
-      // Give Chart.js a tick to layout (no animation; still async)
       await new Promise(r => setTimeout(r, 30));
       const url = offscreen.toDataURL('image/png');
       chart.destroy();
@@ -677,22 +731,18 @@ document.addEventListener('DOMContentLoaded', async () => {
     const lineH = 14;
     const h = pad * 2 + lines.length * lineH;
     doc.setDrawColor(55);
-    doc.setFillColor(243, 244, 246); // gray-100
+    doc.setFillColor(243, 244, 246);
     doc.roundedRect(x, y, w, h, 6, 6, 'FD');
     doc.setTextColor(20);
     doc.setFontSize(11);
-    lines.forEach((ln, i) => {
-      doc.text(ln, x + pad, y + pad + (i + 1) * lineH - 4);
-    });
+    lines.forEach((ln, i) => doc.text(ln, x + pad, y + pad + (i + 1) * lineH - 4));
   }
 
   function drawBulletList(doc, x, y, items) {
     const bullet = '•';
     const lineH = 16;
     doc.setFontSize(11);
-    items.forEach((t, i) => {
-      doc.text(`${bullet} ${t}`, x, y + i * lineH);
-    });
+    items.forEach((t, i) => doc.text(`${bullet} ${t}`, x, y + i * lineH));
   }
 
   // Initial
