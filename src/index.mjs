@@ -7,7 +7,7 @@ import cookieParser from 'cookie-parser';
 import serverless from 'serverless-http';
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { PutCommand, QueryCommand } from "@aws-sdk/lib-dynamodb";
-import { GetItemCommand, UpdateItemCommand } from "@aws-sdk/client-dynamodb";
+// REMOVED: import { GetItemCommand, UpdateItemCommand } from "@aws-sdk/client-dynamodb";
 import { v4 as uuidv4 } from 'uuid';
 import { fileURLToPath } from 'url';
 
@@ -42,17 +42,13 @@ async function checkAuthentication(req, res, next) {
     }
 
     req.user = decoded;
-
     req.username = decoded.custom?.family_name || 'unknown';
-
-
     next();
   } catch (err) {
     return res.status(401).json({ message: 'Authentication failed: Invalid token.' });
   }
 }
 
-// --- Helpers ---
 function parseYearMonth(queryYear, queryMonth) {
   const now = new Date();
   const year = !isNaN(parseInt(queryYear)) ? parseInt(queryYear) : now.getUTCFullYear();
@@ -72,7 +68,7 @@ function parseYearMonth(queryYear, queryMonth) {
 function ymKeyParts(dateMs) {
   const d = new Date(dateMs);
   const y = d.getUTCFullYear();
-  const m = d.getUTCMonth(); // 0..11
+  const m = d.getUTCMonth();
   const mm = String(m + 1).padStart(2, '0');
   return { year: y, month0: m, ym: `${y}-${mm}`, monthStartTs: Date.UTC(y, m, 1, 0, 0, 0) };
 }
@@ -83,7 +79,6 @@ app.get('/username', checkAuthentication, (req, res) => {
   if (!req.user) {
     return res.status(401).json({ message: 'User not authenticated.' });
   }
-  // Liefere beides: Anzeigename + Account/Haushalt aus Token
   res.json({ username: req.username });
 });
 
@@ -117,7 +112,6 @@ app.get('/readings', checkAuthentication, async (req, res) => {
   }
 });
 
-// Neue Messung – username kommt NUR aus Token, delta wird gegen letzte Messung berechnet
 app.post('/readings', checkAuthentication, async (req, res) => {
   const { currentKWh, notes = '' } = req.body;
   const username = req.username;
@@ -127,7 +121,6 @@ app.post('/readings', checkAuthentication, async (req, res) => {
   }
 
   try {
-    // Letzte Messung holen => vorheriger Zählerstand
     const lastResult = await ddbClient.send(new QueryCommand({
       TableName: TABLE_NAME,
       IndexName: 'TimestampIndex',
@@ -152,10 +145,8 @@ app.post('/readings', checkAuthentication, async (req, res) => {
     const { ym, monthStartTs } = ymKeyParts(now);
 
     const reading = {
-      // Reuse "washId" as PK (bestehendes Schema)
       washId: uuidv4(),
-      username,          // wer eingetragen hat (Anzeige)
-      username,       // Haushalt/Account aus Token
+      username,
       startKWh,
       endKWh,
       deltaKWh,
@@ -168,24 +159,6 @@ app.post('/readings', checkAuthentication, async (req, res) => {
       TableName: TABLE_NAME,
       Item: reading
     }));
-
-    // Monatliche Aggregation für den Account
-    const aggId = `ACCOUNT#${username}#${ym}`;
-    const updateAgg = new UpdateItemCommand({
-      TableName: TABLE_NAME,
-      Key: { washId: { S: aggId } },
-      UpdateExpression: 'ADD totalKWh :delta SET username = :an, period = :period, GlobalPK = :gpk, #ts = :ts, updatedAt = :now',
-      ExpressionAttributeNames: { '#ts': 'timestamp' },
-      ExpressionAttributeValues: {
-        ':delta': { N: deltaKWh.toString() },
-        ':an': { S: username },
-        ':period': { S: ym },
-        ':gpk': { S: `ACCOUNT#${username}` },
-        ':ts': { N: monthStartTs.toString() },
-        ':now': { N: now.toString() }
-      }
-    });
-    await ddbClient.send(updateAgg);
 
     return res.status(201).json({ reading });
 
@@ -217,28 +190,6 @@ app.get('/latest-kwh', checkAuthentication, async (req, res) => {
   }
 });
 
-// (Optional) Account-Monatssumme – bleibt kompatibel
-app.get('/accounts/:username/summary', checkAuthentication, async (req, res) => {
-  try {
-    const username = req.params.username;
-    if (!username) return res.status(400).json({ message: 'Missing username.' });
-
-    const { startTimestamp } = parseYearMonth(req.query.year, req.query.month);
-    const { ym } = ymKeyParts(startTimestamp);
-    const aggId = `ACCOUNT#${username}#${ym}`;
-
-    const result = await ddbClient.send(new GetItemCommand({
-      TableName: TABLE_NAME,
-      Key: { washId: { S: aggId } }
-    }));
-
-    const totalKWh = result.Item?.totalKWh?.N ? parseFloat(result.Item.totalKWh.N) : 0;
-    res.json({ username, period: ym, totalKWh });
-  } catch (error) {
-    console.error('Error fetching account summary:', error);
-    res.status(500).json({ message: 'Error fetching account summary', error: error.message });
-  }
-});
 
 // Statische Files
 app.use('/', checkAuthentication, express.static(path.join(__dirname, 'public', 'home')));
